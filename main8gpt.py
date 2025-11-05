@@ -16,6 +16,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 
 from token_updater import TokenUpdater
+from yandex_classifier import YandexGPTClassifier, ThoughtGenerator, ClassificationType
 
 load_dotenv()  # Загружает переменные из .env файла
 
@@ -27,6 +28,10 @@ YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
 # Настройки триггеров
 TRIGGER_WORDS = ['петька', 'петя', 'petka', 'petya', 'петр', 'петруха']
 RANDOM_RESPONSE_PROBABILITY = 0.1
+
+# Настройки классификатора
+USE_THOUGHT_GENERATION = os.getenv('USE_THOUGHT_GENERATION', 'true').lower() == 'true'
+VERBOSE_THOUGHTS = os.getenv('VERBOSE_THOUGHTS', 'false').lower() == 'true'
 
 # Файлы для хранения данных
 INDEX_FILE = "message_index.json"
@@ -68,6 +73,24 @@ class MemoryEnhancedBot:
 
         self.users_cache = {}
         self.conversation_states = {}
+
+        # Инициализация классификатора и генератора мыслей
+        if USE_THOUGHT_GENERATION:
+            try:
+                self.classifier = YandexGPTClassifier(
+                    api_token=YANDEX_GPT_TOKEN,
+                    folder_id=YANDEX_FOLDER_ID
+                )
+                self.thought_generator = ThoughtGenerator(self.classifier, enabled=True)
+                print("✓ Классификатор и генератор мыслей инициализированы")
+            except Exception as e:
+                print(f"⚠ Ошибка инициализации классификатора: {e}")
+                self.classifier = None
+                self.thought_generator = None
+        else:
+            self.classifier = None
+            self.thought_generator = None
+            print("ℹ Генерация мыслей отключена")
         self.tfidf_vectorizer = TfidfVectorizer(
             stop_words=RUSSIAN_STOP_WORDS,
             ngram_range=(1, 2),  # Биграммы для лучшего поиска
@@ -803,7 +826,7 @@ class MemoryEnhancedBot:
         question = ' '.join(question.split()).strip('.,!?;:')
         return question if question else "Что нужно?"
 
-    def ask_yandex_gpt(self, context: str, question: str) -> str:
+    def ask_yandex_gpt(self, context: str, question: str, thought: str = "") -> str:
         """Запрос к Yandex GPT"""
         url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         headers = {
@@ -811,6 +834,18 @@ class MemoryEnhancedBot:
             "Content-Type": "application/json",
             "x-folder-id": YANDEX_FOLDER_ID
         }
+
+        # Формируем системный промпт с учетом мысли
+        system_text = "Ты Петька - помощник в беседе. Отвечай естественно, кратко и по делу."
+        if thought and not VERBOSE_THOUGHTS:
+            # Добавляем мысль в системный промпт (не показываем пользователю)
+            system_text += f"\n\n{thought}"
+
+        # Формируем текст запроса
+        user_text = f"{context}\n\nВопрос: {question}\n\n"
+        if thought and VERBOSE_THOUGHTS:
+            # В verbose режиме показываем мысль в ответе
+            user_text = f"{thought}\n\n{user_text}"
 
         data = {
             "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
@@ -822,11 +857,11 @@ class MemoryEnhancedBot:
             "messages": [
                 {
                     "role": "system",
-                    "text": "Ты Петька - помощник в беседе. Отвечай естественно, кратко и по делу." # Отвечай естественно, кратко и по делу. Отвечай подробно.
+                    "text": system_text
                 },
                 {
                     "role": "user",
-                    "text": f"{context}\n\nВопрос: {question}\n\n"
+                    "text": user_text
                 }
             ]
         }
@@ -931,7 +966,16 @@ class MemoryEnhancedBot:
                         # context = "привет"
                         print("context ", context)
 
-                        response_text = self.ask_yandex_gpt(context, question)
+                        # Генерируем мысль (если включено)
+                        thought = ""
+                        if self.thought_generator:
+                            try:
+                                thought = self.thought_generator.generate(message_text, context)
+                                print(f"💭 {thought}")
+                            except Exception as e:
+                                print(f"⚠ Ошибка генерации мысли: {e}")
+
+                        response_text = self.ask_yandex_gpt(context, question, thought)
                         self.send_message(peer_id, response_text)
 
                         # Сохраняем в память

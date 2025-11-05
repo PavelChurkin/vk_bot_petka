@@ -12,6 +12,20 @@ from dotenv import load_dotenv
 from conversation_manager import ConversationManager
 from token_updater import TokenUpdater
 
+# Импорт парсера ссылок
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from link_parser_enhanced import EnhancedLinkParser
+    LINK_PARSER_AVAILABLE = True
+except ImportError:
+    try:
+        from link_parser import LinkParser as EnhancedLinkParser
+        LINK_PARSER_AVAILABLE = True
+    except ImportError:
+        LINK_PARSER_AVAILABLE = False
+        print("⚠️  Парсер ссылок не доступен. Установите requests для поддержки парсинга ссылок.")
+
 load_dotenv()
 
 # Конфигурация
@@ -39,10 +53,15 @@ class SimpleBot:
         self.users_cache = {}
         self.my_user_id = self.get_my_user_id()
 
+        # Инициализация парсера ссылок
+        self.link_parser = EnhancedLinkParser() if LINK_PARSER_AVAILABLE else None
+
         self.setup_scheduler()
         print(f"Бот запущен! ID: {self.my_user_id}")
         print(f"Триггерные слова: {TRIGGER_WORDS}")
         print("Бот работает в беседах и личных сообщениях")
+        if LINK_PARSER_AVAILABLE:
+            print("✓ Парсинг ссылок включен")
 
     def get_my_user_id(self) -> int:
         try:
@@ -205,7 +224,41 @@ class SimpleBot:
         print(f"пересланные сообщения - {combined_text}")
         return combined_text
 
-    def get_conversation_context(self, peer_id: int, question: str, target_messages: list[dict]) -> str:
+    def process_links(self, message_text: str) -> str:
+        """
+        Обработка ссылок из сообщения
+
+        Args:
+            message_text: Текст сообщения для поиска ссылок
+
+        Returns:
+            Форматированный контекст из содержимого ссылок
+        """
+        if not self.link_parser or not message_text:
+            return ""
+
+        try:
+            # Извлекаем URL из сообщения
+            urls = self.link_parser.extract_urls(message_text)
+
+            if not urls:
+                return ""
+
+            print(f"📎 Найдено ссылок в сообщении: {len(urls)}")
+            for url in urls[:3]:  # Показываем первые 3
+                print(f"  - {url}")
+
+            # Загружаем содержимое (максимум 3 ссылки)
+            links_context = self.link_parser.format_links_context(urls, max_links=3)
+
+            return links_context
+
+        except Exception as e:
+            print(f"⚠️  Ошибка при обработке ссылок: {e}")
+            return ""
+
+    def get_conversation_context(self, peer_id: int, question: str, target_messages: list[dict],
+                                message_text: str = "") -> str:
         """Получить контекст для GPT"""
         # Контекст из истории беседы с передачей callback для получения имен пользователей
         history_context = self.conversation_manager.get_conversation_context(
@@ -217,6 +270,9 @@ class SimpleBot:
         # Контекст из forward сообщений
         forward_context = self.process_forward_messages(target_messages)
 
+        # Контекст из ссылок в сообщении
+        links_context = self.process_links(message_text) if message_text else ""
+
         # Определяем тип беседы для системного промпта
         conversation_type = "личных сообщений" if self.is_private_message(peer_id) else "беседы"
 
@@ -225,6 +281,9 @@ class SimpleBot:
 
         if forward_context:
             context_parts.append(forward_context)
+
+        if links_context:
+            context_parts.append(links_context)
 
         if history_context:
             context_parts.append(history_context)
@@ -399,8 +458,8 @@ class SimpleBot:
 
                         print(f"Вопрос ({dialog_type}): {question}")
 
-                        # Получаем контекст
-                        context = self.get_conversation_context(peer_id, question, target_messages)
+                        # Получаем контекст (включая парсинг ссылок)
+                        context = self.get_conversation_context(peer_id, question, target_messages, message_text)
                         if len(context) > 100:
                             print(f"Контекст: {context[:100]}...")
                         else:

@@ -1,4 +1,5 @@
 import vk_api
+from vk_api.longpoll import VkLongPoll, VkEventType
 import requests
 import json
 import time
@@ -34,6 +35,7 @@ CONVERSATIONS_FILE = "conversations_list.json"
 PROCESSED_MESSAGES_FILE = "processed_messages.json"
 MEMORY_FILE = "conversation_memory.json"
 KEYWORD_INDEX_FILE = "keyword_index.json"
+EDITED_MESSAGES_FILE = "edited_messages.json"
 
 # Русские стоп-слова
 RUSSIAN_STOP_WORDS = [
@@ -48,6 +50,9 @@ class MemoryEnhancedBot:
         self.vk_session = vk_api.VkApi(token=VK_TOKEN)
         self.vk = self.vk_session.get_api()
 
+        # Инициализация Long Poll для получения событий редактирования
+        self.longpoll = VkLongPoll(self.vk_session, preload_messages=True)
+
         # Загрузка данных
         self.message_index = self.load_json(INDEX_FILE, {})
         self.conversations = self.load_json(CONVERSATIONS_FILE, [])
@@ -61,6 +66,9 @@ class MemoryEnhancedBot:
         # Система памяти RAG
         self.conversation_memory = self.load_json(MEMORY_FILE, {})
         self.keyword_index = self.load_json(KEYWORD_INDEX_FILE, {})
+
+        # Хранилище отредактированных сообщений
+        self.edited_messages = self.load_json(EDITED_MESSAGES_FILE, {})
 
         # Инициализация обновления токена
         self.token_updater = TokenUpdater()
@@ -852,6 +860,102 @@ class MemoryEnhancedBot:
         except Exception as e:
             print(f"Ошибка отправки: {e}")
 
+    def handle_message_edit(self, event):
+        """Обработка события редактирования сообщения"""
+        try:
+            message_id = event.message_id
+            peer_id = event.peer_id
+            new_text = event.text
+            timestamp = event.timestamp
+
+            # Получаем старый текст из индекса
+            peer_str = str(peer_id)
+            msg_str = str(message_id)
+
+            old_text = ""
+            if peer_str in self.message_index and msg_str in self.message_index[peer_str]:
+                old_text = self.message_index[peer_str][msg_str].get('text', '')
+
+            # Логируем изменение
+            edit_key = f"{peer_id}_{message_id}"
+            if edit_key not in self.edited_messages:
+                self.edited_messages[edit_key] = []
+
+            edit_entry = {
+                'timestamp': timestamp,
+                'old_text': old_text,
+                'new_text': new_text,
+                'edit_time': time.time()
+            }
+            self.edited_messages[edit_key].append(edit_entry)
+            self.save_json(EDITED_MESSAGES_FILE, self.edited_messages)
+
+            # Обновляем индекс сообщений
+            if peer_str in self.message_index and msg_str in self.message_index[peer_str]:
+                self.message_index[peer_str][msg_str]['text'] = new_text
+                self.message_index[peer_str][msg_str]['edited'] = True
+                self.message_index[peer_str][msg_str]['edit_time'] = timestamp
+                self.save_json(INDEX_FILE, self.message_index)
+
+            # Обновляем ключевой индекс для нового текста
+            if peer_str in self.message_index and msg_str in self.message_index[peer_str]:
+                self.update_keyword_index(
+                    peer_id, message_id,
+                    {'text': new_text, 'timestamp': timestamp}
+                )
+
+            print(f"📝 Сообщение отредактировано в беседе {peer_id}:")
+            print(f"   Старый текст: {old_text}")
+            print(f"   Новый текст: {new_text}")
+
+            # Проверяем, нужно ли реагировать на отредактированное сообщение
+            # Создаем объект сообщения для проверки триггеров
+            message_data = {
+                'id': message_id,
+                'peer_id': peer_id,
+                'text': new_text,
+                'from_id': event.user_id,
+                'date': timestamp,
+                'out': 0  # Предполагаем что это входящее сообщение
+            }
+
+            is_triggered, trigger_type = self.is_triggered_message(new_text, message_data)
+
+            if is_triggered:
+                print(f"Триггер '{trigger_type}' в отредактированном сообщении беседы {peer_id}")
+
+                # Извлекаем целевые сообщения
+                target_messages = self.extract_target_message(message_data)
+                question = self.clean_question(new_text)
+
+                # Получаем контекст
+                context = self.get_enhanced_context(peer_id, question, target_messages)
+
+                # Отправляем ответ
+                response_text = self.ask_yandex_gpt(context, question)
+                self.send_message(peer_id, f"[📝 На отредактированное сообщение]\n{response_text}")
+
+                # Сохраняем в память
+                self.remember_conversation(peer_id, message_data, response_text)
+
+        except Exception as e:
+            print(f"Ошибка обработки редактирования сообщения: {e}")
+
+    def process_longpoll_events(self):
+        """Обработка событий Long Poll (MESSAGE_NEW и MESSAGE_EDIT)"""
+        try:
+            for event in self.longpoll.check():
+                # Обработка новых сообщений
+                if event.type == VkEventType.MESSAGE_NEW:
+                    # Эти сообщения будут обрабатываться через check_new_messages
+                    pass
+
+                # Обработка редактирования сообщений
+                elif event.type == VkEventType.MESSAGE_EDIT:
+                    self.handle_message_edit(event)
+
+        except Exception as e:
+            print(f"Ошибка обработки Long Poll событий: {e}")
 
     def update_all_conversations(self):
         try:
@@ -871,6 +975,7 @@ class MemoryEnhancedBot:
     def setup_scheduler(self):
         schedule.every(5).seconds.do(self.update_all_conversations)
         schedule.every(3).seconds.do(self.check_new_messages)
+        schedule.every(1).seconds.do(self.process_longpoll_events)  # Проверка Long Poll событий
 
         def run_scheduler():
             while True:

@@ -34,6 +34,7 @@ CONVERSATIONS_FILE = "conversations_list.json"
 PROCESSED_MESSAGES_FILE = "processed_messages.json"
 MEMORY_FILE = "conversation_memory.json"
 KEYWORD_INDEX_FILE = "keyword_index.json"
+WALL_POSTS_FILE = "wall_posts.json"
 
 # Русские стоп-слова
 RUSSIAN_STOP_WORDS = [
@@ -47,10 +48,12 @@ class MemoryEnhancedBot:
     def __init__(self):
         self.vk_session = vk_api.VkApi(token=VK_TOKEN)
         self.vk = self.vk_session.get_api()
+        self.vk_tools = vk_api.VkTools(self.vk_session)
 
         # Загрузка данных
         self.message_index = self.load_json(INDEX_FILE, {})
         self.conversations = self.load_json(CONVERSATIONS_FILE, [])
+        self.wall_posts = self.load_json(WALL_POSTS_FILE, {})
 
         # Обработанные сообщения
         processed_data = self.load_json(PROCESSED_MESSAGES_FILE, {})
@@ -480,6 +483,197 @@ class MemoryEnhancedBot:
         except Exception as e:
             print(f"Ошибка получения информации о пользователе: {e}")
         return {'first_name': 'Пользователь', 'last_name': ''}
+
+    def get_wall_posts(self, owner_id: int, count: int = 100, offset: int = 0) -> Tuple[List[Dict], int]:
+        """Получение записей со стены пользователя или сообщества"""
+        try:
+            response = self.vk.wall.get(
+                owner_id=owner_id,
+                count=count,
+                offset=offset,
+                filter='all',
+                extended=0
+            )
+
+            items = response.get('items', [])
+            total_count = response.get('count', 0)
+
+            # Валидация данных
+            valid_items = []
+            for item in items:
+                if 'id' in item and 'date' in item and 'from_id' in item:
+                    valid_items.append(item)
+                else:
+                    print(f"Пропущена некорректная запись: {item}")
+
+            return valid_items, total_count
+
+        except vk_api.exceptions.ApiError as e:
+            print(f"API ошибка при получении записей (offset {offset}): {e}")
+            return [], 0
+        except Exception as e:
+            print(f"Неожиданная ошибка при получении записей: {e}")
+            return [], 0
+
+    def get_all_wall_posts(self, owner_id: int) -> List[Dict]:
+        """Получение ВСЕХ записей со стены с использованием VkTools"""
+        try:
+            print(f"Начинаем загрузку записей со стены {owner_id}...")
+
+            # Используем VkTools.get_all для эффективной загрузки всех записей
+            # get_all автоматически обрабатывает пагинацию и уменьшает количество запросов в 25 раз
+            wall = self.vk_tools.get_all('wall.get', 100, {'owner_id': owner_id, 'filter': 'all'})
+
+            posts = wall.get('items', [])
+            total_count = wall.get('count', 0)
+
+            print(f"Загружено записей со стены: {len(posts)}/{total_count}")
+
+            return posts
+
+        except vk_api.exceptions.ApiError as e:
+            print(f"API ошибка при загрузке стены: {e}")
+            return []
+        except Exception as e:
+            print(f"Неожиданная ошибка при загрузке стены: {e}")
+            return []
+
+    def index_wall_posts(self, owner_id: int, full_update: bool = True) -> bool:
+        """Индексация записей со стены для поиска"""
+        owner_str = str(owner_id)
+
+        if owner_str not in self.wall_posts:
+            self.wall_posts[owner_str] = {}
+
+        current_index = self.wall_posts[owner_str]
+        updated = False
+        new_posts_count = 0
+
+        if full_update:
+            # Загружаем все записи
+            all_posts = self.get_all_wall_posts(owner_id)
+
+            print(f"Обработка {len(all_posts)} записей для индексации...")
+
+            for post in all_posts:
+                post_id = str(post['id'])
+                if post_id not in current_index:
+                    current_index[post_id] = {
+                        'timestamp': post['date'],
+                        'from_id': post['from_id'],
+                        'owner_id': post.get('owner_id', owner_id),
+                        'text': post.get('text', ''),
+                        'attachments': post.get('attachments', []),
+                        'comments': post.get('comments', {}).get('count', 0),
+                        'likes': post.get('likes', {}).get('count', 0),
+                        'reposts': post.get('reposts', {}).get('count', 0),
+                        'views': post.get('views', {}).get('count', 0),
+                        'post_type': post.get('post_type', 'post')
+                    }
+                    updated = True
+                    new_posts_count += 1
+
+                    # Обновляем индекс ключевых слов для постов
+                    text = post.get('text', '')
+                    if text.strip():
+                        self.update_keyword_index_for_wall_post(owner_id, post['id'], text, post['date'])
+
+        if updated:
+            current_index = dict(sorted(
+                current_index.items(),
+                key=lambda x: x[1].get('timestamp', 0),
+                reverse=True  # Новые записи первыми
+            ))
+            self.wall_posts[owner_str] = current_index
+            self.save_json(WALL_POSTS_FILE, self.wall_posts)
+
+            print(f"Индексация стены {owner_id}: "
+                  f"добавлено {new_posts_count} записей, "
+                  f"всего в индексе: {len(current_index)}")
+
+        return updated
+
+    def update_keyword_index_for_wall_post(self, owner_id: int, post_id: int, text: str, timestamp: int):
+        """Обновление индекса ключевых слов для записи со стены"""
+        if not text.strip():
+            return
+
+        words = [
+            word.lower() for word in re.findall(r'\w+', text)
+            if (len(word) > 2 and
+                word.lower() not in RUSSIAN_STOP_WORDS and
+                not word.isdigit())
+        ]
+
+        for word in words:
+            if word not in self.keyword_index:
+                self.keyword_index[word] = []
+
+            entry = {
+                'owner_id': owner_id,
+                'post_id': post_id,
+                'timestamp': timestamp,
+                'score': 1.0,
+                'type': 'wall_post'
+            }
+            self.keyword_index[word].append(entry)
+
+        self.save_json(KEYWORD_INDEX_FILE, self.keyword_index)
+
+    def search_wall_posts(self, owner_id: int, query: str, limit: int = 10) -> List[Dict]:
+        """Поиск записей со стены по ключевым словам"""
+        owner_str = str(owner_id)
+
+        if owner_str not in self.wall_posts:
+            return []
+
+        if not query.strip():
+            # Возвращаем последние записи если запрос пустой
+            posts = list(self.wall_posts[owner_str].values())
+            return posts[:limit]
+
+        # Извлекаем ключевые слова из запроса
+        query_words = [
+            word.lower() for word in re.findall(r'\w+', query)
+            if (len(word) > 2 and
+                word.lower() not in RUSSIAN_STOP_WORDS and
+                not word.isdigit())
+        ]
+
+        if not query_words:
+            posts = list(self.wall_posts[owner_str].values())
+            return posts[:limit]
+
+        # Собираем результаты поиска
+        search_results = {}
+
+        for word in query_words:
+            if word in self.keyword_index:
+                for entry in self.keyword_index[word]:
+                    if entry.get('type') == 'wall_post' and entry.get('owner_id') == owner_id:
+                        post_id = str(entry['post_id'])
+                        if post_id not in search_results:
+                            search_results[post_id] = {
+                                'score': 0,
+                                'post_id': post_id
+                            }
+                        search_results[post_id]['score'] += entry['score']
+
+        # Сортируем по релевантности
+        sorted_results = sorted(
+            search_results.values(),
+            key=lambda x: x['score'],
+            reverse=True
+        )[:limit]
+
+        # Получаем полные данные о постах
+        found_posts = []
+        for result in sorted_results:
+            post_id = result['post_id']
+            if post_id in self.wall_posts[owner_str]:
+                found_posts.append(self.wall_posts[owner_str][post_id])
+
+        return found_posts
 
 
     def get_conversations_list(self) -> List[Dict]:

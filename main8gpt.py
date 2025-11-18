@@ -34,6 +34,7 @@ CONVERSATIONS_FILE = "conversations_list.json"
 PROCESSED_MESSAGES_FILE = "processed_messages.json"
 MEMORY_FILE = "conversation_memory.json"
 KEYWORD_INDEX_FILE = "keyword_index.json"
+CONVERSATION_STATES_FILE = "conversation_states.json"
 
 # Русские стоп-слова
 RUSSIAN_STOP_WORDS = [
@@ -67,7 +68,7 @@ class MemoryEnhancedBot:
         self.token_updater.start_auto_update()
 
         self.users_cache = {}
-        self.conversation_states = {}
+        self.conversation_states = self.load_json(CONVERSATION_STATES_FILE, {})
         self.tfidf_vectorizer = TfidfVectorizer(
             stop_words=RUSSIAN_STOP_WORDS,
             ngram_range=(1, 2),  # Биграммы для лучшего поиска
@@ -106,6 +107,10 @@ class MemoryEnhancedBot:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"Ошибка сохранения {filename}: {e}")
+
+    def save_conversation_states(self):
+        """Сохранение состояний бесед"""
+        self.save_json(CONVERSATION_STATES_FILE, self.conversation_states)
 
     def mark_message_processed(self, peer_id: int, message_id: int):
         peer_str = str(peer_id)
@@ -634,6 +639,7 @@ class MemoryEnhancedBot:
         if full_update or (current_time - self.conversation_states[peer_str]['last_full_update'] > 86400):
             full_update = True
             self.conversation_states[peer_str]['last_full_update'] = current_time
+            self.save_conversation_states()
             print(f"Запуск полного обновления истории для беседы {peer_id}")
 
         # Инициализация индекса
@@ -709,6 +715,7 @@ class MemoryEnhancedBot:
 
             # Обновляем статистику
             self.conversation_states[peer_str]['total_messages'] = len(current_index)
+            self.save_conversation_states()
 
             update_type = "полное" if full_update else "инкрементальное"
             print(f"{update_type} обновление для беседы {peer_id}: "
@@ -896,6 +903,7 @@ class MemoryEnhancedBot:
             print("\nОстановка бота...")
             save_data = {k: list(v) for k, v in self.processed_messages.items()}
             self.save_json(PROCESSED_MESSAGES_FILE, save_data)
+            self.save_conversation_states()
             self.token_updater.stop_auto_update()
 
     def check_new_messages(self):
